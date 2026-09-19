@@ -1,0 +1,50 @@
+#!/bin/sh
+# Dev entrypoint for the `api` container: gate on tests, run the binary, restart
+# it whenever a .go file changes.
+#
+# It deliberately compiles to a binary and runs *that*, rather than using
+# `go run`. `go run` spawns the compiled program as a grandchild, so killing the
+# `go run` pid leaves the old server alive and holding the port — the next
+# restart then fails with "address already in use". A direct child can be
+# signalled reliably.
+set -u
+
+cd /app
+
+BIN=/tmp/evercall
+pid=""
+
+stop() {
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        # Let the server's graceful shutdown run before we loop.
+        wait "$pid" 2>/dev/null || true
+    fi
+    pid=""
+}
+
+trap 'echo "--- signal received, stopping"; stop; exit 0' INT TERM
+
+echo "--- go mod download"
+go mod download || true
+
+while true; do
+    echo "--- go test / vet / build"
+
+    # Hard gates: a red test or vet failure means the binary is NOT restarted,
+    # so a broken save can't be mistaken for a working service. Add
+    # `&& go tool staticcheck ./...` here once it is a tool directive in go.mod.
+    if go test -timeout 10s ./... \
+        && go vet ./... \
+        && go build ${GO_BUILD_FLAGS:-} -o "$BIN" ./cmd/evercall; then
+        echo "--- starting evercall on :${PORT:-8080}"
+        "$BIN" &
+        pid=$!
+    else
+        echo "!!! test/vet/build failed — not starting. Fix and save to retry."
+    fi
+
+    inotifywait -q -r -e modify,create,delete,move --include '\.go$' /app || true
+    echo "--- change detected, restarting"
+    stop
+done

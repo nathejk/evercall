@@ -1,0 +1,252 @@
+# Nathejk Evercall — Project Rules & Context
+
+> **Greenfield.** Nothing but documentation exists in this repo yet. This file
+> describes the *intended* shape of the service, so treat it as the design to
+> build towards, not a description of code that is already here. Items marked
+> **TBC** are not yet decided or not yet verified against the provider's API —
+> confirm them before relying on them, and update this file when you do.
+
+## Overview
+
+**Evercall** is Nathejk's telephony integration service. Evercall is a Danish
+VoIP platform; this repo is the adapter that turns its activity into Nathejk
+domain events.
+
+It does exactly two things:
+
+1. **Ingest** — receives call information from the Evercall platform over HTTP
+   (webhook) when a call arrives/progresses, and publishes it to NATS JetStream
+   as call events.
+2. **Fetch recordings** — some time after a call has ended, pulls the audio
+   recording from the Evercall API, stores it, and publishes an event pointing
+   at the stored audio.
+
+That is the whole scope. It is a headless, single-binary Go service with **no
+frontend and no admin UI** — consumers of the call events (e.g. hq) own the
+operator experience.
+
+Deliberate non-goals: no SPA, no user authentication/session handling, no
+read-model for humans to browse, no outbound calling, no call control (the
+service observes; it does not steer calls).
+
+---
+
+## Architecture
+
+```
+┌──────────────┐  webhook (HTTPS)   ┌───────────────────┐  publish   ┌────────────────┐
+│   Evercall    │ ─────────────────→ │  cmd/evercall (Go)│ ─────────→ │ NATS JetStream │
+│  VoIP platform│                    │                    │            │   "NATHEJK"    │
+│              │ ←───────────────── │  ingest (HTTP in)  │            └───────┬────────┘
+└──────────────┘  REST: GET record  │  fetcher (consumer)│ ←──────────────────┘
+       │                             └─────────┬──────────┘   subscribe (call.ended)
+       │  audio bytes                          │ store
+       └───────────────────────────────────────┴──────────→ recording store (TBC)
+```
+
+One process, two halves that only communicate through JetStream:
+
+- **Ingest (write side, HTTP-driven).** A webhook handler validates and
+  normalises the platform payload and publishes a call event. It does no I/O
+  beyond publishing, so it can answer the platform fast — the platform will
+  retry on non-2xx, and a slow webhook causes duplicate deliveries.
+- **Fetcher (event-driven).** A JetStream consumer reacts to call-ended events,
+  fetches the recording from the Evercall REST API, stores the audio, and
+  publishes a recording event. It runs on a delay/retry schedule because the
+  recording is not available the instant the call ends (**TBC:** how long
+  Evercall takes, and whether it signals availability itself).
+
+Keeping the fetcher behind JetStream rather than inline in the webhook is the
+central design decision: recording retrieval is slow, fails transiently, and
+must be retried, none of which a webhook request can absorb.
+
+### Event subjects
+
+Follow the org pattern `NATHEJK.{entityType}.{entityId}.{event}`. Calls are
+**not** year-scoped (unlike hq's entities), so there is no year segment:
+
+```
+NATHEJK.call.{callId}.received     # inbound call arrived
+NATHEJK.call.{callId}.answered
+NATHEJK.call.{callId}.ended        # with duration, disposition
+NATHEJK.call.{callId}.recorded     # recording stored; carries its location
+```
+
+`{callId}` is the Evercall platform's own call identifier, so the same call maps
+to the same subject across every event and a redelivered webhook is idempotent
+by construction. Do not mint our own id for it.
+
+Event payloads and their Go types belong in `github.com/nathejk/shared-go`
+(`.../messages`, `.../types`) — this repo publishes them, hq and any other
+consumer unmarshal them, and a type duplicated in both repos will drift.
+
+### Raw payloads
+
+Keep the provider's raw webhook body on the published event (or in a dedicated
+`…received.raw` field) alongside the normalised fields. The platform's payload
+is the only evidence of what actually happened, the schema is not ours to
+version, and events are replayed — a normalisation bug is recoverable from a
+retained raw body and unrecoverable without one.
+
+### State
+
+There is deliberately **no MariaDB read model**: nothing in this repo serves
+queries to a human. The event log is the state, and per-call bookkeeping the
+fetcher needs (attempt counts, "already fetched") lives in JetStream KV. Add a
+database only when something genuinely needs indexed queries — and say why in a
+PRD first.
+
+---
+
+## Intended project structure
+
+```
+evercall/
+├── docker-compose.yml       # dev environment (api + external traefik/jetstream)
+├── docker/
+│   ├── Dockerfile           # multistage: api-dev → base → build, prod (prod last)
+│   ├── bin/init             # prod entrypoint (exec's the binary as PID 1)
+│   └── init/api-dev         # dev hot-reload entrypoint
+├── go/
+│   ├── cmd/evercall/        # the single binary: wiring, HTTP server, mux startup
+│   │   ├── main.go          # config from env, dependency wiring
+│   │   ├── routes.go        # webhook + healthcheck routes
+│   │   ├── webhook.go       # one handler per provider callback
+│   │   └── app/             # transport helpers (json, errors, middleware, server)
+│   ├── internal/
+│   │   ├── evercall/        # Evercall REST client (recording download, auth)
+│   │   ├── ingest/          # payload → domain event normalisation
+│   │   ├── fetcher/         # JetStream consumer: recording retrieval + retry
+│   │   ├── recordings/      # recording store abstraction (filesystem/S3)
+│   │   ├── jsonlog/         # structured logger
+│   │   └── vcs/             # build-time version embedding (ldflags -X)
+│   └── go.mod               # module: github.com/nathejk/evercall
+└── .github/workflows/       # build-and-publish → DockerHub (nathejk/evercall)
+```
+
+No `pkg/`, no `vue/`. Generic non-domain code belongs in an external module.
+
+---
+
+## Technology stack
+
+- **Language**: Go (version per `go.mod`; dev container image must match)
+- **HTTP router**: `julienschmidt/httprouter` (as in other Nathejk repos)
+- **Event streaming**: NATS JetStream via `github.com/jrgensen/stream`
+  (`jetstream`, `xstream`, `subject`, `metatagger`)
+- **CQRS seam**: `github.com/jrgensen/cqrs` — take `cqrs.Publisher` /
+  `cqrs.Consumer` interfaces, never a concrete stream client
+- **Shared domain types & messages**: `github.com/nathejk/shared-go`
+- **Recording storage**: TBC — filesystem volume in dev; object storage in prod
+- **Upstream**: Evercall REST API + webhooks (base URL, auth scheme, payload
+  schema and recording endpoint all **TBC** — document them in
+  `internal/evercall` once verified against the real API, not from memory)
+
+---
+
+## External integrations
+
+| Service | Purpose | Config |
+|---|---|---|
+| Evercall (inbound) | Webhook delivering call info | `EVERCALL_WEBHOOK_SECRET` (TBC) |
+| Evercall (outbound) | REST API for recording download | `EVERCALL_BASEURL`, `EVERCALL_TOKEN` |
+| NATS JetStream | Event bus | `JETSTREAM_DSN` (`nats://jetstream:4222` in dev) |
+| Recording store | Audio persistence | `RECORDINGS_DSN` (TBC) |
+
+The HTTP server itself takes `PORT` (8080 in the image — it runs unprivileged
+and cannot bind below 1024) and `MAX_BODY_BYTES`.
+
+Credentials never go in `docker-compose.yml` — dev values live in the gitignored
+`docker-compose.override.yml`.
+
+---
+
+## Coding conventions
+
+### Webhook endpoints
+
+- **Verify the sender before trusting the body.** The webhook is publicly
+  reachable; anything that publishes to the NATHEJK stream on an unauthenticated
+  POST is an event-injection vector. Use the platform's signature/secret
+  mechanism (**TBC**) and reject on mismatch.
+- **Answer fast, publish once.** Validate, publish, `2xx`. No recording fetch,
+  no downstream HTTP call in the request path.
+- **Be idempotent.** The platform retries; assume every delivery can arrive more
+  than once. Keying events by the platform's call id (above) is what makes a
+  duplicate a no-op rather than a second call.
+- Return `2xx` only when the event is durably published. A `200` on a failed
+  publish silently loses a call, because the platform will not retry.
+- Handle unknown event types by logging and returning `2xx` — an unrecognised
+  new platform event must not become a retry loop.
+
+### Go
+
+- Single binary in `cmd/evercall/`. Additional workers are JetStream consumers
+  in the same process, not new `cmd/` entries.
+- All configuration is read from environment variables in `main.go` via
+  `flag.StringVar(..., os.Getenv("..."), ...)` and passed down in a `config`
+  struct. Never read env vars deeper in the call tree.
+- Handlers use `app.WriteJSON` / `app.ReadJSON` / `app.ServerErrorResponse` —
+  not bare `http.Error` or `json.NewEncoder`.
+- Dependencies flow inward: nothing under `internal/` imports `cmd/`.
+- Keep `go test ./...`, `go vet ./...` and `go tool staticcheck ./...` green —
+  the dev loop refuses to restart the binary otherwise.
+- Log with the structured logger; include the call id on every call-scoped log
+  line.
+- **Never log recording audio or full raw payloads at info level** — calls carry
+  personal data.
+
+### Testing
+
+The two failure-prone seams are the provider's payload shape and the retry
+behaviour, so these get tests before anything else:
+
+- Normalisation: table-driven tests from **captured real payload fixtures**
+  (`testdata/`), not hand-written ones — the point is to pin the provider's
+  actual shape, including fields we don't use.
+- Fetcher: `cqrs/cqrstest` fakes for publisher/consumer plus a stubbed HTTP
+  client, covering "not ready yet", transient failure, and permanent failure.
+
+### Language
+
+The domain here is telephony, not the Danish scouting domain: use English terms
+(call, recording, caller, extension). Danish names are only for Nathejk domain
+concepts referenced from shared-go.
+
+---
+
+## Development
+
+Everything runs in containers — nothing is expected to be installed on the host.
+See the `docker-dev-stack` skill.
+
+```sh
+docker compose up -d
+docker compose logs -f api
+docker compose run --rm api go test ./...
+```
+
+External Docker networks `traefik` and `jetstream` are owned by the org infra
+repo and must exist before starting; never define them locally.
+
+The webhook must be reachable by the Evercall platform, which cannot reach
+`*.local.nathejk.dk`. For local end-to-end testing either replay captured
+payloads against the local endpoint with `curl`, or point a tunnel at it — do
+not expose the dev container publicly. (**TBC:** whether Evercall supports a
+per-environment webhook URL for a staging deployment.)
+
+---
+
+## CI/CD
+
+GitHub Actions (`.github/workflows/build-and-publish.yml`) builds the multistage
+image and pushes to DockerHub (`nathejk/evercall`): `latest` on `main`, plus
+`{branch}.{run_number}`. Pull requests build but do not push.
+
+Build args `GIT_COMMIT`, `GIT_BRANCH`, `BUILD_NUMBER`, `BUILD_VERSION` are
+injected into the binary via `-ldflags -X` into `internal/vcs`, so a running
+container reports its provenance (`-version`, and the `/healthcheck` body).
+
+The workflow builds with **no `target`**, so the Dockerfile's last stage is what
+ships — keep `prod` last. There is no separate test step: the `build` stage runs
+`go vet` and `go test`, so a red test fails the image build.

@@ -1,0 +1,73 @@
+# Development environment for the evercall service.
+#
+# `traefik` and `jetstream` are external networks owned by the org infra repo and
+# must already exist — start that stack first. Never define them here.
+#
+# Real credentials belong in docker-compose.override.yml (gitignored), not in
+# this file. See docker-compose.override.yml.example.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      # `base` is the dev stage: Go toolchain + inotify-tools. Never `prod` —
+      # it has no source mount and no hot reload.
+      target: base
+    # Mounted rather than baked in, so the dev loop can be edited without a
+    # rebuild.
+    entrypoint: /init-dev
+    restart: unless-stopped
+    environment:
+      # 8080 (not 80) to match the prod image, which runs unprivileged.
+      PORT: 8080
+      MAX_BODY_BYTES: 1048576
+      JETSTREAM_DSN: nats://jetstream:4222
+      # Pass e.g. -race here to have the dev loop build with it.
+      GO_BUILD_FLAGS: ""
+      # EVERCALL_BASEURL / EVERCALL_TOKEN / EVERCALL_WEBHOOK_SECRET are TBC and
+      # secret — set them in docker-compose.override.yml.
+    volumes:
+      - ./go:/app
+      - ./docker/init/api-dev:/init-dev:ro
+      # Named volume for the Go module + build cache, so restarts stay fast.
+      - api:/go
+      # When shared event payloads move to github.com/nathejk/shared-go, add a
+      # sibling checkout here plus a go/go.work:
+      #   - ../shared-go:/shared-go
+    networks:
+      - local
+      - traefik
+      - jetstream
+    labels:
+      traefik.enable: true
+      traefik.docker.network: traefik
+      # Required: the container listens on 8080, Traefik defaults to 80.
+      traefik.http.services.evercall.loadbalancer.server.port: 8080
+      # HTTP -> HTTPS redirect. The provider posts a signature/secret, so the
+      # webhook is HTTPS even in dev and the verification path is exercised the
+      # same way as in prod.
+      #
+      # The middleware is declared here, not borrowed: despite what the org
+      # rules imply, there is no shared `redirect-to-https@docker`. A middleware
+      # defined by docker labels is scoped to the container that defines it, so
+      # referencing another repo's leaves this router *disabled* and Traefik
+      # answers 404. hq has its own `hq-redirect-to-https` for the same reason.
+      traefik.http.middlewares.evercall-redirect-to-https.redirectscheme.scheme: https
+      traefik.http.middlewares.evercall-redirect-to-https.redirectscheme.permanent: true
+      traefik.http.routers.evercall.rule: Host(`evercall.local.nathejk.dk`)
+      traefik.http.routers.evercall.entrypoints: web
+      traefik.http.routers.evercall.middlewares: evercall-redirect-to-https
+      traefik.http.routers.evercall-secure.rule: Host(`evercall.local.nathejk.dk`)
+      traefik.http.routers.evercall-secure.entrypoints: websecure
+      traefik.http.routers.evercall-secure.tls.certresolver: desec
+
+volumes:
+  api:
+
+networks:
+  local:
+  traefik:
+    external: true
+  jetstream:
+    external: true

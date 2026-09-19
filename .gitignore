@@ -1,0 +1,9 @@
+# Local secrets and per-developer overrides — never committed.
+docker-compose.override.yml
+
+# Captured provider payloads may contain real call data (personal data). Commit
+# fixtures deliberately and scrubbed, not by accident.
+/go/**/testdata/*.local.json
+
+# Local build output
+/go/evercall

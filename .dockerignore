@@ -1,0 +1,9 @@
+# The build context is the repo root, but only go/ and docker/bin/ are needed.
+.git
+.github
+.agents
+.rules
+docker-compose.yml
+docker-compose.override.yml
+roadmap
+**/*.md

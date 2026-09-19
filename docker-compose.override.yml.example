@@ -1,0 +1,16 @@
+# Copy to docker-compose.override.yml (gitignored) and fill in.
+# This is where every credential lives — never in docker-compose.yml.
+
+services:
+  api:
+    environment:
+      # Evercall REST API, used by the recording fetcher. Base URL and auth
+      # scheme are both still TBC — verify against the real API.
+      EVERCALL_BASEURL: ""
+      EVERCALL_TOKEN: ""
+      # Shared secret / signing key used to verify that a webhook really came
+      # from Evercall. Mechanism TBC.
+      EVERCALL_WEBHOOK_SECRET: ""
+
+      # Uncomment to run the dev binary with the race detector.
+      # GO_BUILD_FLAGS: "-race"

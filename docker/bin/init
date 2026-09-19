@@ -1,0 +1,8 @@
+#!/bin/sh
+# Production entrypoint. PID 1 must be the binary itself, so `exec` is not
+# optional: without it this shell stays PID 1 and SIGTERM never reaches the
+# server, so the graceful shutdown in main.go is skipped and Docker kills the
+# container on the stop timeout instead.
+set -eu
+
+exec /evercall "$@"
